@@ -161,8 +161,11 @@ function waitPort(int $port): bool
 // --- spawn two nodes ------------------------------------------------------------------
 
 $logDir = sys_get_temp_dir();
+// IMPORTANT: use the ARRAY command form so PHP runs directly (no `/bin/sh -c` wrapper).
+// With a string command, proc_terminate() would signal the shell, not the php child, and
+// the "crashed" node would keep running — the reaper would (correctly) never fire.
 $node = fn (int $ws, int $ingest, string $log) => proc_open(
-    'php ' . escapeshellarg(__DIR__ . '/node.php') . " {$ws} {$ingest}",
+    [PHP_BINARY, __DIR__ . '/node.php', (string) $ws, (string) $ingest],
     [1 => ['file', $log, 'w'], 2 => ['file', $log, 'a']],
     $pipes
 );
