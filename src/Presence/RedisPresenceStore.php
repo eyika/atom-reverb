@@ -44,11 +44,24 @@ class RedisPresenceStore implements PresenceStore
     ) {
     }
 
+    /**
+     * The three per-channel keys. The channel is wrapped in a Redis Cluster hash tag
+     * ({channel}) so all three land in the same hash slot — required for the multi-key Lua
+     * scripts to run on a sharded Redis Cluster (harmless on a single instance).
+     *
+     * @return array{0:string,1:string,2:string} [conn→user, user→refcount, user→info]
+     */
+    private function keys(string $channel): array
+    {
+        $tag = '{' . $channel . '}';
+        return ["presence:{$tag}", "presence:{$tag}:u", "presence:{$tag}:i"];
+    }
+
     public function join(string $channel, string $connKey, string $userId, array $userInfo): bool
     {
         $refcount = (int) $this->redis->eval(
             self::JOIN,
-            ["presence:{$channel}", "presence:{$channel}:u", "presence:{$channel}:i"],
+            $this->keys($channel),
             [$connKey, $userId, json_encode($userInfo)]
         );
 
@@ -62,7 +75,7 @@ class RedisPresenceStore implements PresenceStore
     {
         $last = (int) $this->redis->eval(
             self::LEAVE,
-            ["presence:{$channel}", "presence:{$channel}:u", "presence:{$channel}:i"],
+            $this->keys($channel),
             [$connKey, $userId]
         );
 
@@ -73,7 +86,7 @@ class RedisPresenceStore implements PresenceStore
 
     public function members(string $channel): array
     {
-        $flat = $this->redis->command(['HGETALL', "presence:{$channel}:i"]);
+        $flat = $this->redis->command(['HGETALL', $this->keys($channel)[2]]);
         if (!is_array($flat)) {
             return [];
         }
@@ -88,7 +101,7 @@ class RedisPresenceStore implements PresenceStore
 
     public function count(string $channel): int
     {
-        return (int) $this->redis->command(['HLEN', "presence:{$channel}:u"]);
+        return (int) $this->redis->command(['HLEN', $this->keys($channel)[1]]);
     }
 
     public function heartbeat(): void
@@ -118,7 +131,7 @@ class RedisPresenceStore implements PresenceStore
                 [$channel, $connKey, $userId] = array_pad(explode("\x1f", (string) $entry), 3, '');
                 $last = (int) $this->redis->eval(
                     self::LEAVE,
-                    ["presence:{$channel}", "presence:{$channel}:u", "presence:{$channel}:i"],
+                    $this->keys($channel),
                     [$connKey, $userId]
                 );
                 if ($last === 1) {
