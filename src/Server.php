@@ -5,6 +5,8 @@ namespace Eyika\Atom\Reverb;
 use Eyika\Atom\Reverb\Auth\Signature;
 use Eyika\Atom\Reverb\Backplane\Backplane;
 use Eyika\Atom\Reverb\Backplane\LocalBackplane;
+use Eyika\Atom\Reverb\Presence\LocalPresenceStore;
+use Eyika\Atom\Reverb\Presence\PresenceStore;
 use Eyika\Atom\Reverb\Protocol\Frame;
 use Eyika\Atom\Reverb\Protocol\Handshake;
 use RuntimeException;
@@ -27,6 +29,8 @@ class Server
 {
     protected ChannelManager $channels;
     protected Backplane $backplane;
+    protected PresenceStore $presence;
+    protected string $nodeId;
     /** @var array<string,mixed> */
     protected array $options;
     /** @var callable|null */
@@ -41,11 +45,14 @@ class Server
         ?ChannelManager $channels = null,
         array $options = [],
         ?Backplane $backplane = null,
-        ?callable $onLog = null
+        ?callable $onLog = null,
+        ?PresenceStore $presence = null
     ) {
         $this->channels = $channels ?? new ChannelManager();
         $this->backplane = $backplane ?? new LocalBackplane();
+        $this->presence = $presence ?? new LocalPresenceStore();
         $this->onLog = $onLog;
+        $this->nodeId = (string) ($options['node_id'] ?? bin2hex(random_bytes(6)));
         $this->options = $options + [
             'host'               => '127.0.0.1',
             'ws_port'            => 8091,
@@ -63,6 +70,11 @@ class Server
     public function channels(): ChannelManager
     {
         return $this->channels;
+    }
+
+    public function presence(): PresenceStore
+    {
+        return $this->presence;
     }
 
     public function start(): void
@@ -296,29 +308,36 @@ class Server
             }
         }
 
-        $member = null;
         if (Signature::isPresence($channel)) {
             $parsed = json_decode((string) $channelData, true);
             $member = is_array($parsed) ? $parsed : ['user_id' => $conn->socketId];
-        }
+            $userId = (string) ($member['user_id'] ?? $conn->socketId);
+            $userInfo = (array) ($member['user_info'] ?? []);
 
-        $this->channels->subscribe($conn->id, $channel, $member);
-        $conn->channels[$channel] = $member;
+            $this->channels->subscribe($conn->id, $channel);
+            $conn->channels[$channel] = ['user_id' => $userId, 'user_info' => $userInfo];
 
-        if (Signature::isPresence($channel)) {
+            // Membership goes through the presence store (Redis-aggregated when clustered).
+            $first = $this->presence->join($channel, $this->connKey($conn), $userId, $userInfo);
             $this->sendPresenceSucceeded($conn, $channel);
-            $this->fanOut($channel, [
-                'event'   => 'pusher_internal:member_added',
-                'channel' => $channel,
-                'data'    => $member,
-            ], $conn->id);
-        } else {
-            $this->send($conn, [
-                'event'   => 'pusher_internal:subscription_succeeded',
-                'channel' => $channel,
-                'data'    => (object) [],
-            ]);
+            if ($first) {
+                $this->broadcastPresence(
+                    $channel,
+                    'pusher_internal:member_added',
+                    ['user_id' => $userId, 'user_info' => $userInfo],
+                    $conn->id
+                );
+            }
+            return;
         }
+
+        $this->channels->subscribe($conn->id, $channel);
+        $conn->channels[$channel] = null;
+        $this->send($conn, [
+            'event'   => 'pusher_internal:subscription_succeeded',
+            'channel' => $channel,
+            'data'    => (object) [],
+        ]);
     }
 
     protected function unsubscribe(Connection $conn, string $channel): void
@@ -331,33 +350,37 @@ class Server
         $this->channels->unsubscribe($conn->id, $channel);
 
         if (Signature::isPresence($channel) && is_array($member)) {
-            $this->fanOut($channel, [
-                'event'   => 'pusher_internal:member_removed',
-                'channel' => $channel,
-                'data'    => ['user_id' => $member['user_id'] ?? null],
-            ]);
+            $userId = (string) ($member['user_id'] ?? '');
+            $last = $this->presence->leave($channel, $this->connKey($conn), $userId);
+            if ($last) {
+                $this->broadcastPresence($channel, 'pusher_internal:member_removed', ['user_id' => $userId]);
+            }
         }
     }
 
     protected function sendPresenceSucceeded(Connection $conn, string $channel): void
     {
-        $members = $this->channels->members($channel);
-        $ids = [];
-        $hash = [];
-        foreach ($members as $m) {
-            $uid = $m['user_id'] ?? null;
-            if ($uid === null) {
-                continue;
-            }
-            $ids[] = $uid;
-            $hash[$uid] = $m['user_info'] ?? [];
-        }
+        $members = $this->presence->members($channel); // global (all nodes) when clustered
+        $ids = array_keys($members);
 
         $this->send($conn, [
             'event'   => 'pusher_internal:subscription_succeeded',
             'channel' => $channel,
-            'data'    => json_encode(['presence' => ['ids' => $ids, 'hash' => $hash, 'count' => count($ids)]]),
+            'data'    => json_encode(['presence' => ['ids' => $ids, 'hash' => $members, 'count' => count($ids)]]),
         ]);
+    }
+
+    /** connKey uniquely identifies a connection cluster-wide, for presence ownership. */
+    protected function connKey(Connection $conn): string
+    {
+        return $this->nodeId . ':' . $conn->id;
+    }
+
+    /** Fan a presence event out locally (except the origin) and to peer nodes. */
+    protected function broadcastPresence(string $channel, string $event, array $data, ?int $exceptId = null): void
+    {
+        $this->fanOut($channel, ['event' => $event, 'channel' => $channel, 'data' => $data], $exceptId);
+        $this->backplane->publish(['channel' => $channel, 'event' => $event, 'data' => $data]);
     }
 
     // --- Broadcasting ------------------------------------------------------------------
@@ -484,6 +507,16 @@ class Server
         }
         $this->lastHeartbeat = $now;
 
+        // Refresh this node's presence liveness + reap crashed peers (no-ops single-node).
+        try {
+            $this->presence->heartbeat();
+            $this->presence->reap(function (string $channel, string $userId) {
+                $this->broadcastPresence($channel, 'pusher_internal:member_removed', ['user_id' => $userId]);
+            });
+        } catch (Throwable $e) {
+            $this->log('presence maintenance error: ' . $e->getMessage());
+        }
+
         $idle = (int) $this->options['idle_timeout'];
         foreach ($this->conns as $conn) {
             if (!$conn->handshook) {
@@ -507,12 +540,11 @@ class Server
         // Fire member_removed for any presence channels before dropping the connection.
         foreach ($conn->channels as $channel => $member) {
             if (Signature::isPresence($channel) && is_array($member)) {
-                $this->channels->unsubscribe($conn->id, $channel);
-                $this->fanOut($channel, [
-                    'event'   => 'pusher_internal:member_removed',
-                    'channel' => $channel,
-                    'data'    => ['user_id' => $member['user_id'] ?? null],
-                ]);
+                $userId = (string) ($member['user_id'] ?? '');
+                $last = $this->presence->leave($channel, $this->connKey($conn), $userId);
+                if ($last) {
+                    $this->broadcastPresence($channel, 'pusher_internal:member_removed', ['user_id' => $userId]);
+                }
             }
         }
         $this->channels->forget($conn->id);

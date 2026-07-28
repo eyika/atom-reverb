@@ -113,8 +113,14 @@ REVERB_REDIS_PORT=6379
 ```
 
 Each node fans a broadcast out to its own connections and relays it to peers via Redis pub/sub (a minimal
-built-in RESP client — no `ext-redis`/predis needed). *Note: presence member lists are per-node in this
-release; cross-node presence aggregation is a planned enhancement.*
+built-in RESP client — no `ext-redis`/predis needed).
+
+**Cross-node presence is aggregated too**: with Redis enabled, presence membership lives in Redis (hashes +
+Lua-atomic reference counting), so `subscription_succeeded` reports the *global* member list and
+`member_added`/`member_removed` propagate across nodes — deduplicated per `user_id` (a user with several
+connections is one member). A liveness heartbeat + reaper cleans up members left behind by a **crashed**
+node. (Without Redis, presence is correct but single-node.) The distributed logic needs a real Redis cluster
+to validate under load; the reference-counting semantics are unit-tested.
 
 ## TLS
 
@@ -133,8 +139,11 @@ REVERB_TLS_KEY=/path/privkey.pem
 - **`Connection`** — per-connection read/write buffers, fragment assembly, heartbeat + socket id.
 - **`Protocol\Handshake` / `Protocol\Frame`** — RFC 6455 handshake + framing (fin-aware).
 - **`Auth\Signature`** — Pusher-style HMAC for channels + ingest.
-- **`ChannelManager`** — subscriptions + presence members.
-- **`Backplane\{Local,Redis}Backplane`** — single-node vs Redis-clustered fan-out.
+- **`ChannelManager`** — channel subscriptions (who to deliver to).
+- **`Presence\{Local,Redis}PresenceStore`** — presence membership (who is present), single-node vs
+  Redis-aggregated with Lua-atomic dedup + a crashed-node reaper.
+- **`Backplane\{Local,Redis}Backplane`** + **`Redis\RedisClient`** — single-node vs Redis-clustered
+  fan-out (pub/sub) and the blocking command client the presence store uses.
 - **`Broadcasting\BroadcastManager`** — app side: signed ingest + `channelAuth()` for the auth endpoint.
 
 ## License

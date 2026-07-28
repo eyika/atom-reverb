@@ -5,6 +5,8 @@ namespace Eyika\Atom\Reverb\Console;
 use Eyika\Atom\Framework\Foundation\Console\Command;
 use Eyika\Atom\Reverb\Backplane\LocalBackplane;
 use Eyika\Atom\Reverb\Backplane\RedisBackplane;
+use Eyika\Atom\Reverb\Presence\RedisPresenceStore;
+use Eyika\Atom\Reverb\Redis\RedisClient;
 use Eyika\Atom\Reverb\Server;
 use Throwable;
 
@@ -37,20 +39,32 @@ class StartCommand extends Command
             'tls'                => (array) $cfg('tls', ['enabled' => false]),
         ];
 
-        $backplane = $cfg('redis.enabled', false)
-            ? new RedisBackplane(
-                (string) $cfg('redis.host', '127.0.0.1'),
-                (int) $cfg('redis.port', 6379),
-                (string) $cfg('redis.channel', 'atom-reverb'),
-                $cfg('redis.password', null) ?: null
-            )
-            : new LocalBackplane();
+        // One id identifies this node for both the presence store and connKeys.
+        $nodeId = bin2hex(random_bytes(6));
+        $options['node_id'] = $nodeId;
+
+        $backplane = new LocalBackplane();
+        $presence = null;
+
+        if ($cfg('redis.enabled', false)) {
+            $host = (string) $cfg('redis.host', '127.0.0.1');
+            $port = (int) $cfg('redis.port', 6379);
+            $password = $cfg('redis.password', null) ?: null;
+
+            $backplane = new RedisBackplane($host, $port, (string) $cfg('redis.channel', 'atom-reverb'), $password);
+            $presence = new RedisPresenceStore(
+                new RedisClient($host, $port, $password),
+                $nodeId,
+                max(60, 2 * (int) $options['heartbeat_interval'])
+            );
+            $this->info('Redis backplane + cluster-wide presence enabled.');
+        }
 
         if ($options['app_secret'] === '') {
             $this->warn('REVERB_APP_SECRET is empty — channel + ingest auth are DISABLED (development only).');
         }
 
-        $server = new Server(null, $options, $backplane, fn (string $msg) => $this->info($msg));
+        $server = new Server(null, $options, $backplane, fn (string $msg) => $this->info($msg), $presence);
 
         try {
             $server->start();
