@@ -49,6 +49,7 @@ class Frame
         $b0 = ord($buffer[0]);
         $b1 = ord($buffer[1]);
 
+        $fin = ($b0 & 0x80) !== 0;
         $opcode = $b0 & 0x0F;
         $masked = ($b1 & 0x80) !== 0;
         $payloadLen = $b1 & 0x7F;
@@ -88,6 +89,7 @@ class Frame
         }
 
         return [
+            'fin'      => $fin,
             'opcode'   => $opcode,
             'payload'  => $payload,
             'consumed' => $offset + $payloadLen,
