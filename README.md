@@ -1,5 +1,9 @@
 # Atom Reverb
 
+> 📖 **Documentation:** the canonical guide for this package lives in the Atom docs —
+> **[Official Packages → atom-reverb](https://basttyydev.serv00.net/docs/beta/packages#atom-reverb)**.
+> This README is a quick reference; the docs cover channel auth, presence, and the Redis backplane in full.
+
 A **production WebSocket broadcast server** for the [Atom framework](https://github.com/eyika/atomframework) —
 Pusher-protocol compatible, dependency-free (built on `stream_socket_server` + `stream_select`),
 and hardened for real deployments:
