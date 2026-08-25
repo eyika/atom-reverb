@@ -28,9 +28,32 @@ Auto-discovered via `extra.atom.providers`. Set credentials in `.env`:
 ```dotenv
 REVERB_APP_KEY=your-app-key
 REVERB_APP_SECRET=a-long-random-secret   # signs channel auth + ingest — REQUIRED in production
-REVERB_PORT=8091
-REVERB_INGEST_PORT=8092
+REVERB_PORT=8091                         # → config key `ws_port`
+REVERB_INGEST_PORT=8092                  # → config key `ingest_port`
 ```
+
+**Publish the config rather than hand-writing it.** The config keys are not named after the env
+vars: `REVERB_PORT` feeds **`ws_port`**, and Redis settings live under a **nested** `redis` array,
+not a flat boolean.
+
+```php
+// config/reverb.php — the shape the package actually reads
+'host'        => env('REVERB_HOST', '127.0.0.1'),
+'ws_port'     => (int) env('REVERB_PORT', 8091),
+'ingest_port' => (int) env('REVERB_INGEST_PORT', 8092),
+
+'redis' => [
+    'enabled'  => (bool) env('REVERB_REDIS', false),
+    'host'     => env('REVERB_REDIS_HOST', '127.0.0.1'),
+    'port'     => (int) env('REVERB_REDIS_PORT', 6379),
+    'password' => env('REVERB_REDIS_PASSWORD', null),
+    'channel'  => env('REVERB_REDIS_CHANNEL', 'atom-reverb'),
+],
+```
+
+A config written as `'port' => …` or `'redis' => true` is simply never read. That is easy to miss,
+because `ws_port` defaults to 8091 too — so the mismatch only shows itself once someone overrides
+`REVERB_PORT`, and then it looks like the override is broken rather than the key.
 
 ## Run
 
@@ -39,8 +62,24 @@ php artisan reverb:start
 php artisan reverb:start --host=0.0.0.0 --ws-port=8091 --ingest-port=8092
 ```
 
+### Two ports, and why there is no `--port`
+
+The server binds **two** sockets, and they are a security boundary rather than tidiness:
+
+| Port | Option | Who reaches it |
+|---|---|---|
+| WebSocket | `--ws-port` | the public edge — browsers connect here |
+| Ingest | `--ingest-port` | **your app servers only** — this is where broadcasts are published |
+
+**Anyone who can reach the ingest port can publish to any channel, including another tenant's
+private ones.** Keep it on the private network, firewalled to the app servers.
+
+There is deliberately no single `--port`, and passing one is **silently ignored** — the daemon binds
+its defaults, so everything downstream can end up pointing at a port nothing serves. Always pass the
+two explicitly, or set them in config.
+
 Run it under a process supervisor (systemd / supervisor). Put nginx/Caddy in front for TLS and to
-expose only the WS port publicly — keep the **ingest port firewalled** to the app servers.
+expose only the WS port publicly.
 
 ## Connect from the browser
 
